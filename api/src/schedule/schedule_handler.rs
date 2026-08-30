@@ -1,16 +1,16 @@
 use crate::error::ApiError;
 use crate::model::ScheduleProjectPipeline;
 use crate::schedule::PipelineAggregator;
-use actix_web::web;
-use actix_web::web::{Data, Json};
+use crate::state::AppState;
+use crate::util::querystring::QueryString;
+use axum::extract::State;
+use axum::routing::get;
+use axum::{Json, Router};
 use serde::Deserialize;
-use serde_querystring_actix::QueryString;
+use std::sync::Arc;
 
-pub fn setup_handlers(cfg: &mut web::ServiceConfig) {
-    cfg.route(
-        "/schedules/latest-pipelines",
-        web::get().to(get_with_latest_pipeline),
-    );
+pub fn routes() -> Router<AppState> {
+    Router::new().route("/schedules/latest-pipelines", get(get_with_latest_pipeline))
 }
 
 #[derive(Deserialize)]
@@ -24,7 +24,7 @@ async fn get_with_latest_pipeline(
         group_id,
         project_ids,
     }): QueryString<GetQuery>,
-    aggregator: Data<PipelineAggregator>,
+    State(aggregator): State<Arc<PipelineAggregator>>,
 ) -> Result<Json<Vec<ScheduleProjectPipeline>>, ApiError> {
     let result = aggregator
         .get_schedules_with_latest_pipeline(group_id, project_ids)

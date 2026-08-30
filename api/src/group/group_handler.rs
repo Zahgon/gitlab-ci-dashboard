@@ -1,17 +1,20 @@
 use crate::error::ApiError;
 use crate::group::group_service::GroupService;
 use crate::model::Group;
-use actix_web::web::{Data, Json};
-use actix_web::{web, HttpRequest};
+use crate::state::AppState;
+use axum::extract::{OriginalUri, State};
+use axum::routing::get;
+use axum::{Json, Router};
+use std::sync::Arc;
 
-pub fn setup_handlers(cfg: &mut web::ServiceConfig) {
-    cfg.route("/groups", web::get().to(get_groups));
+pub fn routes() -> Router<AppState> {
+    Router::new().route("/groups", get(get_groups))
 }
 
 async fn get_groups(
-    req: HttpRequest,
-    group_service: Data<GroupService>,
+    OriginalUri(uri): OriginalUri,
+    State(group_service): State<Arc<GroupService>>,
 ) -> Result<Json<Vec<Group>>, ApiError> {
-    let result = group_service.get_groups(req.path()).await?;
+    let result = group_service.get_groups(uri.path()).await?;
     Ok(Json(result))
 }

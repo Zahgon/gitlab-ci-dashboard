@@ -1,7 +1,7 @@
 use crate::config::config_app::AppConfig;
 use crate::error::ApiError;
 use crate::gitlab::GitlabApi;
-use actix_web::web::Bytes;
+use bytes::Bytes;
 use moka::future::Cache;
 use std::sync::Arc;
 

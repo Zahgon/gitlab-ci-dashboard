@@ -3,15 +3,19 @@
 use crate::config::config_app::{ApiConfig, AppConfig};
 use crate::config::config_file;
 use crate::gitlab::GitlabClient;
+use crate::metrics::Metrics;
 use crate::spa::Spa;
-use actix_web::dev::HttpServiceFactory;
-use actix_web::web::{Data, ServiceConfig};
-use actix_web::{middleware::Logger, web, App, HttpResponse, HttpServer, Responder};
-use actix_web_prom::{PrometheusMetrics, PrometheusMetricsBuilder};
+use crate::state::AppState;
+use axum::extract::Request;
+use axum::http::{header, HeaderMap, HeaderName, Method, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{any, get};
+use axum::{Extension, Router};
 use dotenv::dotenv;
-use serde_querystring_actix::{ParseMode, QueryStringConfig};
 use std::sync::Arc;
-use web::scope;
+use std::time::Instant;
+use tokio::net::TcpListener;
 
 mod artifact;
 mod branch;
@@ -20,15 +24,16 @@ mod error;
 mod gitlab;
 mod group;
 mod job;
+mod metrics;
 mod model;
 mod pipeline;
 mod project;
 mod schedule;
 mod spa;
+mod state;
 mod util;
 
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
+fn main() -> std::io::Result<()> {
     dotenv().ok();
     env_logger::init();
 
@@ -52,134 +57,160 @@ async fn main() -> std::io::Result<()> {
     log::debug!("{app_config:?}");
     log::debug!("{api_config:?}");
 
-    let api_config = Data::new(api_config);
-    let qs_config = QueryStringConfig::default().parse_mode(ParseMode::Delimiter(b','));
+    // Actix spawned `server_workers` worker threads itself. Axum runs on a
+    // plain tokio runtime, so the runtime is built by hand to keep the
+    // `SERVER_WORKER_COUNT` setting meaningful.
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(app_config.server_workers.max(1))
+        .enable_all()
+        .build()?
+        .block_on(serve(app_config, api_config))
+}
 
+async fn serve(app_config: AppConfig, api_config: ApiConfig) -> std::io::Result<()> {
     let gitlab_client = Arc::new(GitlabClient::new(
         &app_config.gitlab_url,
         &app_config.gitlab_token,
     ));
 
-    let group_service = Data::new(group::GroupService::new(
+    let group_service = Arc::new(group::GroupService::new(
         gitlab_client.clone(),
         app_config.clone(),
     ));
-    let pipeline_service = Data::new(pipeline::PipelineService::new(
+    let pipeline_service = Arc::new(pipeline::PipelineService::new(
         gitlab_client.clone(),
         app_config.clone(),
     ));
-    let project_service = Data::new(project::ProjectService::new(
+    let project_service = Arc::new(project::ProjectService::new(
         gitlab_client.clone(),
         app_config.clone(),
     ));
-    let job_service = Data::new(job::JobService::new(
+    let job_service = Arc::new(job::JobService::new(
         gitlab_client.clone(),
         app_config.clone(),
     ));
-    let branch_service = Data::new(branch::BranchService::new(
+    let branch_service = Arc::new(branch::BranchService::new(
         gitlab_client.clone(),
         app_config.clone(),
     ));
-    let artifact_service = Data::new(artifact::ArtifactService::new(
+    let artifact_service = Arc::new(artifact::ArtifactService::new(
         gitlab_client.clone(),
         app_config.clone(),
     ));
 
-    let project_aggr = Data::new(project::PipelineAggregator::new(
-        project_service.get_ref().clone(),
-        pipeline_service.get_ref().clone(),
-        job_service.get_ref().clone(),
+    let project_aggr = Arc::new(project::PipelineAggregator::new(
+        project_service.as_ref().clone(),
+        pipeline_service.as_ref().clone(),
+        job_service.as_ref().clone(),
     ));
-    let branch_aggr = Data::new(branch::PipelineAggregator::new(
-        branch_service.get_ref().clone(),
-        pipeline_service.get_ref().clone(),
-        job_service.get_ref().clone(),
+    let branch_aggr = Arc::new(branch::PipelineAggregator::new(
+        branch_service.as_ref().clone(),
+        pipeline_service.as_ref().clone(),
+        job_service.as_ref().clone(),
     ));
-    let schedule_aggr = Data::new(schedule::PipelineAggregator::new(
+    let schedule_aggr = Arc::new(schedule::PipelineAggregator::new(
         schedule::ScheduleService::new(gitlab_client.clone(), app_config.clone()),
-        project_service.get_ref().clone(),
-        pipeline_service.get_ref().clone(),
-        job_service.get_ref().clone(),
+        project_service.as_ref().clone(),
+        pipeline_service.as_ref().clone(),
+        job_service.as_ref().clone(),
     ));
 
-    let prom = setup_prometheus();
+    let app = configure_app(
+        Arc::new(api_config),
+        group_service,
+        project_aggr,
+        branch_aggr,
+        schedule_aggr,
+        job_service,
+        pipeline_service,
+        branch_service,
+        artifact_service,
+    );
 
-    HttpServer::new(move || {
-        App::new()
-            .wrap(Logger::default())
-            .wrap(prom.clone())
-            .configure(configure_app(
-                api_config.clone(),
-                qs_config.clone(),
-                group_service.clone(),
-                project_aggr.clone(),
-                branch_aggr.clone(),
-                schedule_aggr.clone(),
-                job_service.clone(),
-                pipeline_service.clone(),
-                branch_service.clone(),
-                artifact_service.clone(),
-            ))
-    })
-    .bind((app_config.server_ip, app_config.server_port))?
-    .workers(app_config.server_workers)
-    .run()
-    .await
+    let listener = TcpListener::bind((app_config.server_ip.as_str(), app_config.server_port)).await?;
+
+    axum::serve(listener, app).await
 }
 
 #[allow(clippy::too_many_arguments)]
 fn configure_app(
-    api_config: Data<ApiConfig>,
-    qs_config: QueryStringConfig,
-    group_service: Data<group::GroupService>,
-    project_aggr: Data<project::PipelineAggregator>,
-    branch_aggr: Data<branch::PipelineAggregator>,
-    schedule_aggr: Data<schedule::PipelineAggregator>,
-    job_service: Data<job::JobService>,
-    pipeline_service: Data<pipeline::PipelineService>,
-    branch_service: Data<branch::BranchService>,
-    artifact_service: Data<artifact::ArtifactService>,
-) -> impl FnOnce(&mut ServiceConfig) {
-    move |config| {
-        config
-            .app_data(api_config)
-            .app_data(qs_config)
-            .app_data(group_service)
-            .app_data(project_aggr)
-            .app_data(branch_aggr)
-            .app_data(schedule_aggr)
-            .app_data(job_service)
-            .app_data(pipeline_service)
-            .app_data(branch_service)
-            .app_data(artifact_service)
-            .route("/health", web::get().to(health_handler))
-            .service(
-                scope("/api")
-                    .configure(config::setup_handlers)
-                    .configure(group::setup_handlers)
-                    .configure(project::setup_handlers)
-                    .configure(pipeline::setup_handlers)
-                    .configure(branch::setup_handlers)
-                    .configure(schedule::setup_handlers)
-                    .configure(job::setup_handlers)
-                    .configure(artifact::setup_handlers),
-            )
-            .service(setup_spa());
+    api_config: Arc<ApiConfig>,
+    group_service: Arc<group::GroupService>,
+    project_aggregator: Arc<project::PipelineAggregator>,
+    branch_aggregator: Arc<branch::PipelineAggregator>,
+    schedule_aggregator: Arc<schedule::PipelineAggregator>,
+    job_service: Arc<job::JobService>,
+    pipeline_service: Arc<pipeline::PipelineService>,
+    branch_service: Arc<branch::BranchService>,
+    artifact_service: Arc<artifact::ArtifactService>,
+) -> Router {
+    let state = AppState {
+        api_config,
+        group_service,
+        project_aggregator,
+        branch_aggregator,
+        schedule_aggregator,
+        job_service,
+        pipeline_service,
+        branch_service,
+        artifact_service,
+    };
+
+    let prom = Arc::new(setup_prometheus());
+
+    Router::new()
+        .route("/health", get(health_handler))
+        .route("/metrics/prometheus", get(metrics::render))
+        .nest("/api", api_routes())
+        .route("/api/", any(api_not_found))
+        .fallback_service(setup_spa())
+        .with_state(state)
+        .layer(Extension(prom.clone()))
+        .layer(middleware::from_fn_with_state(prom, metrics::track))
+        .layer(middleware::from_fn(log_request))
+}
+
+fn api_routes() -> Router<AppState> {
+    Router::new()
+        .merge(config::routes())
+        .merge(group::routes())
+        .merge(project::routes())
+        .merge(pipeline::routes())
+        .merge(branch::routes())
+        .merge(schedule::routes())
+        .merge(job::routes())
+        .merge(artifact::routes())
+        .fallback(api_not_found)
+        .method_not_allowed_fallback(api_not_found)
+        .layer(middleware::from_fn(reject_head))
+}
+
+/// Actix' `web::get()` guard matched GET alone, so `HEAD /api/..` fell out of
+/// the scope as a `404`. Axum answers HEAD with the GET handler unless it is
+/// stopped before routing.
+async fn reject_head(request: Request, next: Next) -> Response {
+    if request.method() == Method::HEAD {
+        return StatusCode::NOT_FOUND.into_response();
     }
+    next.run(request).await
 }
 
-async fn health_handler() -> impl Responder {
-    HttpResponse::Ok().finish()
+/// Actix' `scope("/api")` consumed every request below the prefix, so unknown
+/// paths and wrong methods answered `404` instead of reaching the SPA fallback
+/// or producing a `405`.
+async fn api_not_found() -> StatusCode {
+    StatusCode::NOT_FOUND
 }
 
-fn setup_prometheus() -> PrometheusMetrics {
-    PrometheusMetricsBuilder::new(String::default().as_str())
-        .endpoint("/metrics/prometheus")
-        .build()
-        .expect("prometheus endpoint to be created")
+async fn health_handler() -> StatusCode {
+    StatusCode::OK
 }
 
-fn setup_spa() -> impl HttpServiceFactory {
+fn setup_prometheus() -> Metrics {
+    Metrics::new().expect("prometheus endpoint to be created")
+}
+
+fn setup_spa() -> Router {
     if cfg!(debug_assertions) {
         Spa::default().finish()
     } else {
@@ -187,17 +218,52 @@ fn setup_spa() -> impl HttpServiceFactory {
     }
 }
 
+/// Access log, replacing actix' `Logger::default()` middleware.
+async fn log_request(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let version = request.version();
+    let target = match request.uri().query() {
+        Some(query) => format!("{}?{}", request.uri().path(), query),
+        None => request.uri().path().to_owned(),
+    };
+    let referer = header_or_dash(request.headers(), header::REFERER);
+    let user_agent = header_or_dash(request.headers(), header::USER_AGENT);
+
+    let started = Instant::now();
+    let response = next.run(request).await;
+    let elapsed = started.elapsed().as_secs_f64();
+
+    let status = response.status().as_u16();
+    let size = header_or_dash(response.headers(), header::CONTENT_LENGTH);
+
+    log::info!(
+        "\"{method} {target} {version:?}\" {status} {size} \"{referer}\" \"{user_agent}\" {elapsed:.6}"
+    );
+
+    response
+}
+
+fn header_or_dash(headers: &HeaderMap, name: HeaderName) -> String {
+    headers
+        .get(&name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-")
+        .to_owned()
+}
+
 #[cfg(test)]
 mod tests {
-    use actix_web::body::to_bytes;
-    use actix_web::test;
-    use actix_web::web::Bytes;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use bytes::Bytes;
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
     use serde_json::json;
+    use serial_test::serial;
     use std::collections::HashMap;
     use std::env;
     use std::ops::Deref;
+    use tower::ServiceExt;
 
     use crate::error::ApiError;
     use crate::gitlab::GitlabApi;
@@ -212,64 +278,61 @@ mod tests {
     macro_rules! setup_app {
         () => {{
             use super::*;
-            use actix_web::{test, App};
 
             env::set_var("GITLAB_BASE_URL", "https://gitlab.url");
             env::set_var("GITLAB_API_TOKEN", "token123");
             env::set_var("API_READ_ONLY", "false");
 
             let gcd_config = AppConfig::new();
-            let qs_config = QueryStringConfig::default().parse_mode(ParseMode::Delimiter(b','));
 
             let gitlab_client = Arc::new(GitlabClientTest {});
 
-            let api_config = Data::new(ApiConfig::new());
+            let api_config = Arc::new(ApiConfig::new());
 
-            let group_service = Data::new(group::GroupService::new(
+            let group_service = Arc::new(group::GroupService::new(
                 gitlab_client.clone(),
                 gcd_config.clone(),
             ));
-            let pipeline_service = Data::new(pipeline::PipelineService::new(
+            let pipeline_service = Arc::new(pipeline::PipelineService::new(
                 gitlab_client.clone(),
                 gcd_config.clone(),
             ));
-            let project_service = Data::new(project::ProjectService::new(
+            let project_service = Arc::new(project::ProjectService::new(
                 gitlab_client.clone(),
                 gcd_config.clone(),
             ));
-            let job_service = Data::new(job::JobService::new(
+            let job_service = Arc::new(job::JobService::new(
                 gitlab_client.clone(),
                 gcd_config.clone(),
             ));
-            let branch_service = Data::new(branch::BranchService::new(
+            let branch_service = Arc::new(branch::BranchService::new(
                 gitlab_client.clone(),
                 gcd_config.clone(),
             ));
-            let artifact_service = Data::new(artifact::ArtifactService::new(
+            let artifact_service = Arc::new(artifact::ArtifactService::new(
                 gitlab_client.clone(),
                 gcd_config.clone(),
             ));
 
-            let project_aggr = Data::new(project::PipelineAggregator::new(
-                project_service.get_ref().clone(),
-                pipeline_service.get_ref().clone(),
-                job_service.get_ref().clone(),
+            let project_aggr = Arc::new(project::PipelineAggregator::new(
+                project_service.as_ref().clone(),
+                pipeline_service.as_ref().clone(),
+                job_service.as_ref().clone(),
             ));
-            let branch_aggr = Data::new(branch::PipelineAggregator::new(
-                branch_service.get_ref().clone(),
-                pipeline_service.get_ref().clone(),
-                job_service.get_ref().clone(),
+            let branch_aggr = Arc::new(branch::PipelineAggregator::new(
+                branch_service.as_ref().clone(),
+                pipeline_service.as_ref().clone(),
+                job_service.as_ref().clone(),
             ));
-            let schedule_aggr = Data::new(schedule::PipelineAggregator::new(
+            let schedule_aggr = Arc::new(schedule::PipelineAggregator::new(
                 schedule::ScheduleService::new(gitlab_client.clone(), gcd_config.clone()),
-                project_service.get_ref().clone(),
-                pipeline_service.get_ref().clone(),
-                job_service.get_ref().clone(),
+                project_service.as_ref().clone(),
+                pipeline_service.as_ref().clone(),
+                job_service.as_ref().clone(),
             ));
 
-            test::init_service(App::new().configure(configure_app(
+            configure_app(
                 api_config,
-                qs_config,
                 group_service,
                 project_aggr,
                 branch_aggr,
@@ -278,8 +341,7 @@ mod tests {
                 pipeline_service,
                 branch_service,
                 artifact_service,
-            )))
-            .await
+            )
         }};
     }
 
@@ -370,54 +432,64 @@ mod tests {
         std::str::from_utf8(value).expect("str to be created from bytes")
     }
 
-    #[actix_web::test]
+    fn get(uri: &str) -> Request<Body> {
+        Request::get(uri)
+            .body(Body::empty())
+            .expect("request to be created")
+    }
+
+    fn post(uri: &str) -> Request<Body> {
+        Request::post(uri)
+            .body(Body::empty())
+            .expect("request to be created")
+    }
+
+    async fn call(app: Router, request: Request<Body>) -> (StatusCode, Bytes) {
+        let response = app.oneshot(request).await.expect("response to be created");
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body to be read");
+
+        (status, body)
+    }
+
+    #[tokio::test]
     async fn test_config_endpoint() {
         env::set_var("VERSION", "1.0.0");
 
         let app = setup_app!();
-        let req = test::TestRequest::get().uri("/api/config").to_request();
-        let resp = test::call_service(&app, req).await;
+        let (status, body) = call(app, get("/api/config")).await;
 
-        let status = resp.status();
         assert!(status.is_success());
 
-        let body = to_bytes(resp.into_body()).await.unwrap();
         let result = serde_json::from_str::<ApiConfig>(to_str(&body)).unwrap();
 
         assert_eq!(result.api_version, "1.0.0");
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_health_endpoint() {
         let app = setup_app!();
-        let req = test::TestRequest::get().uri("/health").to_request();
-        let resp = test::call_service(&app, req).await;
+        let (status, _body) = call(app, get("/health")).await;
 
-        assert!(resp.status().is_success());
+        assert!(status.is_success());
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_groups_endpoint() {
         let app = setup_app!();
-        let req = test::TestRequest::get().uri("/api/groups").to_request();
-        let resp = test::call_service(&app, req).await;
+        let (status, _body) = call(app, get("/api/groups")).await;
 
-        let status = resp.status();
         assert!(status.is_success());
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_projects_with_latest_pipelines_endpoint() {
         let app = setup_app!();
-        let req = test::TestRequest::get()
-            .uri("/api/projects/latest-pipelines?group_id=1")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+        let (status, body) = call(app, get("/api/projects/latest-pipelines?group_id=1")).await;
 
-        let status = resp.status();
         assert!(status.is_success());
-
-        let body = to_bytes(resp.into_body()).await.unwrap();
 
         let result = serde_json::from_str::<Vec<ProjectPipeline>>(to_str(&body)).unwrap();
         assert_eq!(result.len(), 1);
@@ -430,18 +502,12 @@ mod tests {
         assert_eq!(pipeline.id, 1);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_projects_with_pipelines_endpoint() {
         let app = setup_app!();
-        let req = test::TestRequest::get()
-            .uri("/api/projects/pipelines?group_id=1")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+        let (status, body) = call(app, get("/api/projects/pipelines?group_id=1")).await;
 
-        let status = resp.status();
         assert!(status.is_success());
-
-        let body = to_bytes(resp.into_body()).await.unwrap();
 
         let result = serde_json::from_str::<Vec<ProjectPipelines>>(to_str(&body)).unwrap();
         assert_eq!(result.len(), 1);
@@ -456,18 +522,12 @@ mod tests {
         assert_eq!(pipelines[0].id, 1);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_branches_with_latest_pipelines_endpoint() {
         let app = setup_app!();
-        let req = test::TestRequest::get()
-            .uri("/api/branches/latest-pipelines?project_id=456")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+        let (status, body) = call(app, get("/api/branches/latest-pipelines?project_id=456")).await;
 
-        let status = resp.status();
         assert!(status.is_success());
-
-        let body = to_bytes(resp.into_body()).await.unwrap();
 
         let result = serde_json::from_str::<Vec<BranchPipeline>>(to_str(&body)).unwrap();
         assert_eq!(result.len(), 1);
@@ -480,36 +540,25 @@ mod tests {
         assert_eq!(pipeline.id, 1);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_branches_endpoint() {
         let app = setup_app!();
-        let req = test::TestRequest::get()
-            .uri("/api/branches?project_id=456")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+        let (status, body) = call(app, get("/api/branches?project_id=456")).await;
 
-        let status = resp.status();
         assert!(status.is_success());
 
-        let body = to_bytes(resp.into_body()).await.unwrap();
         let branches = serde_json::from_str::<Vec<Branch>>(to_str(&body)).unwrap();
 
         assert_eq!(branches.len(), 1);
         assert_eq!(branches[0].name, "branch-1");
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_schedules_with_latest_pipelines_endpoint() {
         let app = setup_app!();
-        let req = test::TestRequest::get()
-            .uri("/api/schedules/latest-pipelines?group_id=1")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+        let (status, body) = call(app, get("/api/schedules/latest-pipelines?group_id=1")).await;
 
-        let status = resp.status();
         assert!(status.is_success());
-
-        let body = to_bytes(resp.into_body()).await.unwrap();
 
         let result = serde_json::from_str::<Vec<ScheduleProjectPipeline>>(to_str(&body)).unwrap();
         assert_eq!(result.len(), 1);
@@ -524,75 +573,67 @@ mod tests {
         assert_eq!(pipeline.id, 1);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_jobs_endpoint() {
         let app = setup_app!();
-        let req = test::TestRequest::get()
-            .uri("/api/jobs?project_id=456&pipeline_id=1&scope=running")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+        let (status, body) = call(
+            app,
+            get("/api/jobs?project_id=456&pipeline_id=1&scope=running"),
+        )
+        .await;
 
-        let status = resp.status();
         assert!(status.is_success());
 
-        let body = to_bytes(resp.into_body()).await.unwrap();
         let jobs = serde_json::from_str::<Vec<Job>>(to_str(&body)).unwrap();
         assert_eq!(jobs.len(), 1);
 
         assert_eq!(jobs[0].id, 1);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_pipelines_endpoint() {
         let app = setup_app!();
-        let req = test::TestRequest::get()
-            .uri("/api/pipelines?project_id=456&source=web")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+        let (status, body) = call(app, get("/api/pipelines?project_id=456&source=web")).await;
 
-        let status = resp.status();
         assert!(status.is_success());
 
-        let body = to_bytes(resp.into_body()).await.unwrap();
         let pipelines = serde_json::from_str::<Vec<Pipeline>>(to_str(&body)).unwrap();
         assert_eq!(pipelines.len(), 1);
 
         assert_eq!(pipelines[0].id, 1);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_retry_pipeline_endpoint() {
         let app = setup_app!();
-        let req = test::TestRequest::post()
-            .uri("/api/pipelines/retry?project_id=456&pipeline_id=1")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+        let (status, body) = call(
+            app,
+            post("/api/pipelines/retry?project_id=456&pipeline_id=1"),
+        )
+        .await;
 
-        let status = resp.status();
         assert!(status.is_success());
 
-        let body = to_bytes(resp.into_body()).await.unwrap();
         let pipeline = serde_json::from_str::<Pipeline>(to_str(&body)).unwrap();
         assert_eq!(pipeline.id, 1);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_cancel_pipeline_endpoint() {
         let app = setup_app!();
-        let req = test::TestRequest::post()
-            .uri("/api/pipelines/cancel?project_id=456&pipeline_id=1")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+        let (status, body) = call(
+            app,
+            post("/api/pipelines/cancel?project_id=456&pipeline_id=1"),
+        )
+        .await;
 
-        let status = resp.status();
         assert!(status.is_success());
 
-        let body = to_bytes(resp.into_body()).await.unwrap();
         let pipeline = serde_json::from_str::<Pipeline>(to_str(&body)).unwrap();
         assert_eq!(pipeline.id, 1);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_start_pipeline_endpoint() {
         let app = setup_app!();
         let body = json!({
@@ -602,33 +643,117 @@ mod tests {
                 "key1": "value1"
             }
         });
-        let req = test::TestRequest::post()
-            .uri("/api/pipelines/start")
-            .set_json(body)
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+        let request = Request::post("/api/pipelines/start")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .expect("request to be created");
 
-        let status = resp.status();
+        let (status, body) = call(app, request).await;
+
         assert!(status.is_success());
 
-        let body = to_bytes(resp.into_body()).await.unwrap();
         let pipeline = serde_json::from_str::<Pipeline>(to_str(&body)).unwrap();
         assert_eq!(pipeline.id, 1);
     }
 
-    #[actix_web::test]
+    #[tokio::test]
     async fn test_artifact_endpoint() {
         let app = setup_app!();
-        let req = test::TestRequest::get()
-            .uri("/api/artifacts?project_id=456&job_id=1")
-            .to_request();
-        let resp = test::call_service(&app, req).await;
+        let (status, body) = call(app, get("/api/artifacts?project_id=456&job_id=1")).await;
 
-        let status = resp.status();
         assert!(status.is_success());
 
-        let body = to_bytes(resp.into_body()).await.unwrap();
-
         assert_eq!(String::from_utf8_lossy(body.deref()), "hello");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_unknown_api_path_returns_not_found() {
+        let app = setup_app!();
+        let (status, body) = call(app, get("/api/does-not-exist")).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_api_route_with_wrong_method_returns_not_found() {
+        let app = setup_app!();
+        let (status, _body) = call(app, post("/api/config")).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_head_on_api_route_returns_not_found() {
+        let app = setup_app!();
+        let request = Request::head("/api/config")
+            .body(Body::empty())
+            .expect("request to be created");
+
+        let (status, _body) = call(app, request).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_missing_query_parameter_returns_bad_request() {
+        let app = setup_app!();
+        let (status, body) = call(app, get("/api/jobs?project_id=456&pipeline_id=1")).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(to_str(&body).starts_with("Query deserialize error:"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_comma_delimited_scope_is_parsed_as_a_sequence() {
+        let app = setup_app!();
+        let (status, body) = call(
+            app,
+            get("/api/jobs?project_id=456&pipeline_id=1&scope=running,failed,success"),
+        )
+        .await;
+
+        assert!(status.is_success());
+
+        let jobs = serde_json::from_str::<Vec<Job>>(to_str(&body)).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_start_pipeline_with_incomplete_body_returns_bad_request() {
+        let app = setup_app!();
+        let request = Request::post("/api/pipelines/start")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({ "project_id": 1 }).to_string()))
+            .expect("request to be created");
+
+        let (status, body) = call(app, request).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(to_str(&body).starts_with("Json deserialize error:"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_start_pipeline_with_wrong_content_type_returns_bad_request() {
+        let app = setup_app!();
+        let request = Request::post("/api/pipelines/start")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from(
+                json!({ "project_id": 1, "branch": "main" }).to_string(),
+            ))
+            .expect("request to be created");
+
+        let (status, body) = call(app, request).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(to_str(&body), "Content type error");
     }
 }

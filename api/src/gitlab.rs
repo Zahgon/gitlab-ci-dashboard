@@ -3,7 +3,7 @@ use crate::model::Project;
 use crate::model::Schedule;
 use crate::model::{Branch, Group, Job};
 use crate::model::{JobStatus, Pipeline};
-use actix_web::web::Bytes;
+use bytes::Bytes;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::header::{HeaderMap, HeaderValue};

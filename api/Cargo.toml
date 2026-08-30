@@ -4,24 +4,24 @@ version = "0.0.0"
 edition = "2021"
 
 [dependencies]
-actix-web = "4.13.0"
-actix-web-prom = { version = "0.10.0", features = ["process"] }
-actix-files = { version = "0.6.10" }
-actix-service = { version = "2.0.3" }
-actix-http = "3.12.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-serde-querystring-actix = "0.3.0"
 chrono = { version = "0.4.44", features = ["serde"] }
 dotenv = "0.15.0"
 env_logger = "0.11.10"
 log = "0.4.29"
 moka = { version = "0.12.15", features = ["future"] }
 reqwest = { version = "0.13.3", features = ["json"] }
-tokio = { version = "1.52.3", features = ["sync"] }
+tokio = { version = "1.52.3", features = ["macros", "net", "rt-multi-thread", "sync"] }
 async-trait = "0.1.89"
 futures = "0.3.32"
 toml = "1.1.2"
+tower = { version = "0.5.3", features = ["util"] }
+serde-querystring = "0.3.0"
+prometheus = { version = "0.14.0", features = ["process"] }
+bytes = "1.12.1"
+axum = "0.8.9"
+tower-http = { version = "0.7.0", features = ["fs"] }
 
 [dev-dependencies]
 serial_test = "3.4.0"

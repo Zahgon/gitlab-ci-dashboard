@@ -1,13 +1,16 @@
 use crate::error::ApiError;
 use crate::job::JobService;
 use crate::model::{Job, JobStatus};
-use actix_web::web;
-use actix_web::web::{Data, Json};
+use crate::state::AppState;
+use crate::util::querystring::QueryString;
+use axum::extract::State;
+use axum::routing::get;
+use axum::{Json, Router};
 use serde::Deserialize;
-use serde_querystring_actix::QueryString;
+use std::sync::Arc;
 
-pub fn setup_handlers(cfg: &mut web::ServiceConfig) {
-    cfg.route("/jobs", web::get().to(get_jobs));
+pub fn routes() -> Router<AppState> {
+    Router::new().route("/jobs", get(get_jobs))
 }
 
 #[derive(Deserialize)]
@@ -23,7 +26,7 @@ async fn get_jobs(
         pipeline_id,
         scope,
     }): QueryString<GetQuery>,
-    job_service: Data<JobService>,
+    State(job_service): State<Arc<JobService>>,
 ) -> Result<Json<Vec<Job>>, ApiError> {
     let result = job_service
         .get_jobs(project_id, pipeline_id, &scope)

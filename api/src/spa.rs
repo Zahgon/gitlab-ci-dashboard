@@ -1,14 +1,23 @@
+use axum::Router;
 use std::borrow::Cow;
+use tower_http::services::{ServeDir, ServeFile};
 
-use actix_files::{Files, NamedFile};
-use actix_service::fn_service;
-use actix_web::dev::{HttpServiceFactory, ResourceDef, ServiceRequest, ServiceResponse};
-
-#[derive(Debug, Clone)]
+/// Serves a single page application: every path that does not resolve to a
+/// file below `static_resources_location` falls back to `index_file`, so the
+/// client side router can take over.
 pub struct Spa {
+    /// Path to the index file which is served when no static resource matches.
     index_file: Cow<'static, str>,
+    /// Route prefix the static resources are mounted on.
     static_resources_mount: Cow<'static, str>,
+    /// Directory the static resources are read from.
     static_resources_location: Cow<'static, str>,
+}
+
+impl Default for Spa {
+    fn default() -> Self {
+        Self::new("./index.html", "/", "./")
+    }
 }
 
 impl Spa {
@@ -24,59 +33,18 @@ impl Spa {
         }
     }
 
-    /// Constructs the service for use in a `.service()` call.
-    pub fn finish(self) -> impl HttpServiceFactory {
-        let index_file = self.index_file.into_owned();
-        let static_resources_location = self.static_resources_location.into_owned();
-        let static_resources_mount = self.static_resources_mount.into_owned();
+    pub fn finish(self) -> Router {
+        // `fallback` rather than `not_found_service`: the latter rewrites the
+        // status to 404, while actix served the index with 200 OK so the
+        // client side router can resolve the route.
+        let serve_dir = ServeDir::new(self.static_resources_location.as_ref())
+            .fallback(ServeFile::new(self.index_file.as_ref()));
 
-        let files = {
-            let index_file = index_file.clone();
-            Files::new(&static_resources_mount, static_resources_location)
-                // HACK: FilesService will try to read a directory listing unless index_file is provided
-                // FilesService will fail to load the index_file and will then call our default_handler
-                .index_file("extremely-unlikely-to-exist-!@$%^&*.txt")
-                .default_handler(move |req| serve_index(req, index_file.clone()))
-        };
-
-        SpaService { index_file, files }
-    }
-}
-
-#[derive(Debug)]
-struct SpaService {
-    index_file: String,
-    files: Files,
-}
-
-impl HttpServiceFactory for SpaService {
-    fn register(self, config: &mut actix_web::dev::AppService) {
-        // let Files register its mount path as-is
-        self.files.register(config);
-
-        // also define a root prefix handler directed towards our SPA index
-        let rdef = ResourceDef::root_prefix("");
-        config.register_service(
-            rdef,
-            None,
-            fn_service(move |req| serve_index(req, self.index_file.clone())),
-            None,
-        );
-    }
-}
-
-async fn serve_index(
-    req: ServiceRequest,
-    index_file: String,
-) -> Result<ServiceResponse, actix_web::Error> {
-    let (req, _) = req.into_parts();
-    let file = NamedFile::open_async(&index_file).await?;
-    let res = file.into_response(&req);
-    Ok(ServiceResponse::new(req, res))
-}
-
-impl Default for Spa {
-    fn default() -> Self {
-        Self::new("./index.html", "/", "./")
+        let mount = self.static_resources_mount.as_ref();
+        if mount == "/" {
+            Router::new().fallback_service(serve_dir)
+        } else {
+            Router::new().nest_service(mount, serve_dir)
+        }
     }
 }

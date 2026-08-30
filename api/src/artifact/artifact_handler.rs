@@ -1,12 +1,16 @@
 use crate::artifact::ArtifactService;
 use crate::error::ApiError;
-use actix_web::web;
-use actix_web::web::{Bytes, Data};
+use crate::state::AppState;
+use crate::util::querystring::QueryString;
+use axum::extract::State;
+use axum::routing::get;
+use axum::Router;
+use bytes::Bytes;
 use serde::Deserialize;
-use serde_querystring_actix::QueryString;
+use std::sync::Arc;
 
-pub fn setup_handlers(cfg: &mut web::ServiceConfig) {
-    cfg.route("/artifacts", web::get().to(get_artifact));
+pub fn routes() -> Router<AppState> {
+    Router::new().route("/artifacts", get(get_artifact))
 }
 
 #[derive(Deserialize)]
@@ -17,7 +21,7 @@ struct GetQuery {
 
 async fn get_artifact(
     QueryString(GetQuery { project_id, job_id }): QueryString<GetQuery>,
-    artifact_service: Data<ArtifactService>,
+    State(artifact_service): State<Arc<ArtifactService>>,
 ) -> Result<Bytes, ApiError> {
     artifact_service.get_artifact(project_id, job_id).await
 }
